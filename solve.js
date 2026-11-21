@@ -248,7 +248,11 @@ export function run(input) {
         pos = n;
       }
     } else {
-      const f = [];
+      // Pre-sized to the first record's width: the common record fills it
+      // exactly, so no push and no growth; short rows are cut back to their
+      // count and re-padded by the tail below, long rows grow as before.
+      const f = width < 0 ? [] : new Array(width);
+      let count = 0;
       let ended;
       do {
         if (text.charCodeAt(pos) === 34) {
@@ -258,9 +262,10 @@ export function run(input) {
           lastQuoted = false;
           scanUnquoted('');
         }
-        f.push(fValue);
+        f[count++] = fValue;
         ended = fEnded;
       } while (ended === COMMA);
+      f.length = count;
       fields = f;
     }
 
