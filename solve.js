@@ -199,6 +199,8 @@ export function run(input) {
     if (fAdded > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
   }
 
+  // The record loop below is the only place fields are assembled; every branch
+  // above sets fValue/fEnded/fAdded, so no field ever carries a stale value.
   for (;;) {
     // Lines with no characters are no records.
     while (pos < n) {
