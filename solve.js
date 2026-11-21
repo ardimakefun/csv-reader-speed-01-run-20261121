@@ -60,6 +60,7 @@ export function run(input) {
   let fValue = '';
   let fEnded = END;
   let fAdded = 0; // characters kept after the field's starting value
+  let segEnd = -1; // the LF ending the line the current field sits on, or -1 when unknown
 
   // Reads an unquoted field starting at pos, appending onto `init`: a CR not
   // followed by LF is dropped (stray_cr) and scanning continues after it.
@@ -67,11 +68,16 @@ export function run(input) {
   function scanUnquoted(init) {
     let v = init;
     let added = 0;
+    // The line this field sits on ends at segEnd (the LF, or the end of the
+    // text); a quoted field may have crossed lines, so it is searched for
+    // again whenever it is unknown, and reused for every field on the line.
+    if (segEnd === -1) {
+      segEnd = text.indexOf('\n', pos);
+      if (segEnd === -1) segEnd = n;
+    }
     for (;;) {
       const dc = text.indexOf(',', pos);
-      const dl = text.indexOf('\n', pos);
-      let d = dc === -1 ? dl : dl === -1 ? dc : dc < dl ? dc : dl;
-      if (d === -1) d = n;
+      const d = dc === -1 ? segEnd : dc < segEnd ? dc : segEnd;
       const seg = text.slice(pos, d);
       const r = seg.indexOf('\r');
       if (r === -1) {
@@ -151,6 +157,8 @@ export function run(input) {
         let idx = -1;
         while ((idx = rep.indexOf('\n', idx + 1)) !== -1) nl++;
         line += nl;
+        // The quoted field crossed lines, so the cached line end is stale.
+        if (nl > 0) segEnd = -1;
         v += rep;
       }
       if (text.charCodeAt(q + 1) === 34) {
@@ -219,20 +227,42 @@ export function run(input) {
 
     recordLine = line;
     recordRow = header && columns === null ? null : rows.length;
-    const fields = [];
+    // The line this record sits on ends at segEnd (the LF, or the end of the
+    // text); the field readers reuse it instead of searching for it again.
+    segEnd = text.indexOf('\n', pos);
+    if (segEnd === -1) segEnd = n;
+    let fields;
     let lastQuoted = false;
-    let ended;
-    do {
-      if (text.charCodeAt(pos) === 34) {
-        lastQuoted = true;
-        scanQuoted();
+    // Fast path: a record whose span holds no quote and no stray CR is just
+    // its line split on commas (a CR that ends a CRLF line is the terminator,
+    // not a stray CR). About one record in five takes this path.
+    let contentEnd = segEnd;
+    if (segEnd < n && segEnd > pos && text.charCodeAt(segEnd - 1) === 13) contentEnd = segEnd - 1;
+    const span = text.slice(pos, contentEnd);
+    if (span.indexOf('"') === -1 && span.indexOf('\r') === -1) {
+      fields = span.split(',');
+      if (segEnd < n) {
+        pos = segEnd + 1;
+        line += 1;
       } else {
-        lastQuoted = false;
-        scanUnquoted('');
+        pos = n;
       }
-      fields.push(fValue);
-      ended = fEnded;
-    } while (ended === COMMA);
+    } else {
+      const f = [];
+      let ended;
+      do {
+        if (text.charCodeAt(pos) === 34) {
+          lastQuoted = true;
+          scanQuoted();
+        } else {
+          lastQuoted = false;
+          scanUnquoted('');
+        }
+        f.push(fValue);
+        ended = fEnded;
+      } while (ended === COMMA);
+      fields = f;
+    }
 
     // A line that held only stray CRs is left with no characters: no record
     // (its stray_cr errors stay).
