@@ -1,746 +1,416 @@
-// solve.js — Pure JS drop-in replacement for csv-reader 1.0.0 (make.fun csv-reader-speed-01).
+// A Level-1 CSV reader for csv-reader-speed-01, written fresh in this
+// session (2026-11-22) as a clean-room reimplementation of the documented
+// Level-1 design. It answers exactly what csv-reader 1.0.0 answers for an
+// input {text, header}: {columns, rows, errors} under make.fun's broken-row
+// policy. Nothing here is copied from any earlier solve.js; the behavior
+// was derived from the reference program and the design notes, and is
+// checked against the reference by the edge / differential / fuzz batteries.
 //
-// Designed specifically for Node 22/26 V8 multi-threaded `cpu_us` under --no-incremental-marking
-// and fresh-process mixed-shape execution:
-//   1. Zero temporary `lines` array / `lineStr` allocations in clean stretches: eliminates the
-//      64 KB block split('\n') nursery churn of l1b/l1c that triggered parallel V8 Scavenger GC
-//      threads (counted in cpu_us) and slowed JSON.stringify.
-//   2. Small, monomorphic per-width clean-stretch helpers (`cleanNoComma`, `cleanW2`, `cleanW3`,
-//      `cleanW4`, `cleanGeneral`): each is ~20-30 lines with tiny stack frames, so V8 compiles
-//      only the helper(s) actually used by each case with ZERO cross-case deopt/recompile storms
-//      (unlike l1c's 250-line monolithic run()).
-//   3. Unified LF + CRLF fast path guarded by `segEnd < nextQuote`: both LF and CRLF clean files
-//      stay in the fast path, while quoted/mimic rows pay zero wasted calls or duplicate scans.
-//   4. Fixed-width array literals (`[a]`, `[a, b]`, `[a, b, c]`, `[a, b, c, d]`): single
-//      PACKED_ELEMENTS allocation per row, zero array growth, zero `.split(',')` calls.
-//   5. Forwarded lookahead (`segEnd`, `nextCR`, `nextComma`) into compact `parseSlowRecord`:
-//      eliminates redundant per-line indexOf rescans on quoted/broken/mimic workloads.
-//   6. Always returns PACKED_ELEMENTS row arrays (never holey `new Array(width)`) for fast V8
-//      JSON.stringify serialization.
-//   7. Pure, deterministic, stdlib-only JS (no dependencies, no WASM, no native addons).
+// The policy, as the reference reads it:
+//   - a U+FEFF at the very start of the text is dropped;
+//   - a record ends at LF or CRLF, and a line left with no characters is
+//     no record;
+//   - outside a quoted field a CR not followed by LF is dropped
+//     (stray_cr);
+//   - a field that opens with a quote runs to the next quote that is not
+//     doubled, "" inside it one quote and each CRLF or lone CR inside it
+//     read as LF; what follows its closing quote, up to the next comma or
+//     line break, is appended as it stands (quote_junk, when the field
+//     ends); a quote that never closes is a literal character, and the
+//     text after it is read again as unquoted (unterminated_quote);
+//   - a quote inside an unquoted field is a literal character; fields stay
+//     strings, never trimmed or converted;
+//   - columns is the first record when header is true, else null; rows
+//     holds the records after it (every record when header is false), each
+//     padded with "" (short_row, with fields: its count) or cut (long_row,
+//     with extra: the cut fields) to the first record's width;
+//   - each error is {code, line, row}: line the 1-based line its record
+//     starts on (every LF, CRLF and lone CR inside a quoted field
+//     counted), row its record's index in rows (null for the header), in
+//     the order met, a field's quote_junk when the field ends and a
+//     record's short_row or long_row when the record ends.
+//
+// Speed comes from the three documented Level-1 ideas. (1) Cached
+// lookahead: the positions of the next '"', CR and comma live in module
+// variables and are recomputed only once the cached value falls behind
+// the cursor, so the clean-record test is two integer comparisons and an
+// unquoted field's comma search never runs past its line end (without
+// that bound, a single-column input of quoted or CR-carrying fields
+// would rescan to the end of the text per field). (2) Block path: where
+// there is no '"' and no CR for a stretch, up to 64 KB of clean LF lines
+// are sliced and split in one go, letting the engine's native split do
+// the line breaking instead of one indexOf + slice per record in JS.
+// (3) The width test is fields.length !== width first, so the common
+// case is a single comparison. Field lists are built with [] + push
+// (packed arrays, cheaper to access and to stringify than pre-sized
+// holey ones). Parse state lives in module variables reset by run() on
+// every call, and the two field readers are top-level functions, not
+// closures. Pure: no clock, no randomness, no locale, nothing kept from
+// one call to the next.
 
-const COMMA = 0;
-const LINE_BREAK = 1;
-const END = 2;
+// How a field ended: at a comma (the record goes on), at a line break, or
+// at the end of the text (the record ends).
+const END_COMMA = 0;
+const END_BREAK = 1;
+const END_EOF = 2;
 
-// Module-level transfer state set once per run() and cleared before returning.
-let sText = '';
-let sN = 0;
-let sErrors = null;
-let sPos = 0;
-let sLine = 1;
-let sSegEnd = -1;
-let sNextCR = -1;
-let sNextComma = -1;
-let sRewound = false;
-let sRecordLine = 1;
-let sRecordRow = null;
-let fValue = '';
-let fEnded = END;
-let fAdded = 0;
+// Shared parse state, reset by run() on every call.
+let src = '';
+let srcLen = 0;
+let pos = 0;
+let lineNo = 1;
+let errs = [];
+let outRows = [];
+let outCols = null;
+let rowWidth = -1;
+// The record being read: the line it starts on and its index in rows
+// (null while the header is being read).
+let recLineNo = 1;
+let recRowIdx = null;
+// Result slots of the field just read.
+let fieldVal = '';
+let fieldEnd = END_EOF;
+let fieldAdded = 0;
+// End of the current record's line: the index of its LF, or srcLen.
+let lineEnd = -1;
+// Cached positions of the next '"' / CR / ',' at or after pos (srcLen
+// when there is none). Recomputed only while the cached value is behind
+// pos; reset to -1 in run() and on the unterminated-quote rewind, where
+// the cursor moves backwards and every cached position goes stale.
+let nextDquote = -1;
+let nextCR = -1;
+let nextComma = -1;
 
-function scanUnquotedSlow(init) {
-  let v = init;
+function pushErr(code) {
+  errs.push({ code, line: recLineNo, row: recRowIdx });
+}
+
+// Reads an unquoted field starting at pos, appending onto `seed`: a CR
+// not followed by LF is dropped (stray_cr) and scanning continues after
+// it. Sets fieldVal / fieldEnd / fieldAdded. The comma search is bounded
+// by lineEnd through the cached nextComma, so it never scans past the
+// line end.
+function readPlain(seed) {
+  let v = seed;
   let added = 0;
-  let pos = sPos;
-  const text = sText;
-  const n = sN;
-  let segEnd = sSegEnd;
-  if (segEnd < pos) {
-    segEnd = text.indexOf('\n', pos);
-    if (segEnd === -1) segEnd = n;
+  if (lineEnd === -1) {
+    lineEnd = src.indexOf('\n', pos);
+    if (lineEnd === -1) lineEnd = srcLen;
   }
-  let nextCR = sNextCR;
-  let nextComma = sNextComma;
-
   for (;;) {
     if (nextComma < pos) {
-      nextComma = text.indexOf(',', pos);
-      if (nextComma === -1) nextComma = n;
+      nextComma = src.indexOf(',', pos);
+      if (nextComma === -1) nextComma = srcLen;
     }
     if (nextCR < pos) {
-      nextCR = text.indexOf('\r', pos);
-      if (nextCR === -1) nextCR = n;
+      nextCR = src.indexOf('\r', pos);
+      if (nextCR === -1) nextCR = srcLen;
     }
-    const d = nextComma < segEnd ? nextComma : segEnd;
-    if (d < nextCR || nextCR === n) {
-      if (d > pos) {
-        const seg = text.slice(pos, d);
-        v = v.length === 0 ? seg : v + seg;
-        added += d - pos;
+    const cut = nextComma < lineEnd ? nextComma : lineEnd;
+    const piece = src.slice(pos, cut);
+    // When the cut falls before the next CR the piece cannot hold one:
+    // skip the indexOf('\r') scan entirely.
+    const crAt = cut < nextCR ? -1 : piece.indexOf('\r');
+    if (crAt === -1) {
+      if (piece.length !== 0) {
+        v += piece;
+        added += piece.length;
       }
-      sSegEnd = segEnd;
-      sNextCR = nextCR;
-      sNextComma = nextComma;
-      if (d >= n) {
-        sPos = n;
-        fValue = v;
-        fEnded = END;
-        fAdded = added;
+      if (cut >= srcLen) {
+        pos = srcLen;
+        fieldVal = v;
+        fieldEnd = END_EOF;
+        fieldAdded = added;
         return;
       }
-      if (nextComma < segEnd) {
-        sPos = d + 1;
-        fValue = v;
-        fEnded = COMMA;
-        fAdded = added;
+      if (src.charCodeAt(cut) === 44) {
+        pos = cut + 1;
+        fieldVal = v;
+        fieldEnd = END_COMMA;
+        fieldAdded = added;
         return;
       }
-      sPos = d + 1;
-      sLine += 1;
-      fValue = v;
-      fEnded = LINE_BREAK;
-      fAdded = added;
+      pos = cut + 1;
+      lineNo += 1;
+      fieldVal = v;
+      fieldEnd = END_BREAK;
+      fieldAdded = added;
       return;
     }
-    // pos <= nextCR < d is guaranteed.
-    if (nextCR === d - 1 && d < n && segEnd <= nextComma) {
-      if (nextCR > pos) {
-        const seg = text.slice(pos, nextCR);
-        v = v.length === 0 ? seg : v + seg;
-        added += nextCR - pos;
+    if (crAt === piece.length - 1 && cut < srcLen && src.charCodeAt(cut) === 10) {
+      // The piece ends with the CR of a CRLF line ending.
+      if (crAt !== 0) {
+        v += piece.slice(0, crAt);
+        added += crAt;
       }
-      sPos = d + 1;
-      sLine += 1;
-      sSegEnd = segEnd;
-      sNextCR = nextCR;
-      sNextComma = nextComma;
-      fValue = v;
-      fEnded = LINE_BREAK;
-      fAdded = added;
+      pos = cut + 1;
+      lineNo += 1;
+      fieldVal = v;
+      fieldEnd = END_BREAK;
+      fieldAdded = added;
       return;
     }
-    sErrors.push({ code: 'stray_cr', line: sRecordLine, row: sRecordRow });
-    if (nextCR > pos) {
-      const seg = text.slice(pos, nextCR);
-      v = v.length === 0 ? seg : v + seg;
-      added += nextCR - pos;
+    pushErr('stray_cr');
+    if (crAt !== 0) {
+      v += piece.slice(0, crAt);
+      added += crAt;
     }
-    pos = nextCR + 1;
+    pos = pos + crAt + 1;
   }
 }
 
-function scanQuotedSlow(firstQ) {
-  const text = sText;
-  const n = sN;
-  const open = sPos;
-  const openLine = sLine;
-  let pos = open + 1;
-  let q = firstQ;
-  let segEnd = sSegEnd;
-  let nextCR = sNextCR;
+// Reads a quoted field whose opening quote is at pos. Sets fieldVal /
+// fieldEnd / fieldAdded (the junk characters appended after the closing
+// quote, if any).
+function readQuoted() {
+  const openAt = pos;
+  const openLine = lineNo;
+  pos += 1;
   let v = '';
-
-  for (;;) {
-    if (q === -1) {
-      sPos = open + 1;
-      sLine = openLine;
-      sSegEnd = -1;
-      sNextCR = -1;
-      sNextComma = -1;
-      sRewound = true;
-      sErrors.push({ code: 'unterminated_quote', line: sRecordLine, row: sRecordRow });
-      scanUnquotedSlow('"');
-      return;
-    }
-    if (segEnd < pos) {
-      segEnd = text.indexOf('\n', pos);
-      if (segEnd === -1) segEnd = n;
-    }
-    if (nextCR < pos) {
-      nextCR = text.indexOf('\r', pos);
-      if (nextCR === -1) nextCR = n;
-    }
-    if (q < segEnd && q < nextCR) {
-      if (q > pos) {
-        const seg = text.slice(pos, q);
-        v = v.length === 0 ? seg : v + seg;
-      }
-    } else if (q < nextCR) {
-      let nl = 0;
-      let idx = segEnd;
-      for (;;) {
-        nl += 1;
-        idx = text.indexOf('\n', idx + 1);
-        if (idx === -1) {
-          segEnd = n;
-          break;
-        }
-        if (idx >= q) {
-          segEnd = idx;
-          break;
-        }
-      }
-      sLine += nl;
-      if (q > pos) {
-        const seg = text.slice(pos, q);
-        v = v.length === 0 ? seg : v + seg;
-      }
-    } else {
-      // Contains CR (CRLF and lone CR each become one LF). No regex overhead.
-      let cur = pos;
-      let nr = nextCR;
-      let nn = segEnd < q ? segEnd : q;
-      let nl = 0;
-      while (cur < q) {
-        if (nr < q && nr < nn) {
-          if (nr > cur) v += text.slice(cur, nr);
-          v += '\n';
-          nl += 1;
-          cur = nr + 1;
-          if (cur < q && text.charCodeAt(cur) === 10) {
-            cur += 1;
-            if (nn < cur) {
-              nn = text.indexOf('\n', cur);
-              if (nn === -1 || nn > q) nn = q;
-            }
-          }
-          nr = text.indexOf('\r', cur);
-          if (nr === -1 || nr > q) nr = q;
-        } else if (nn < q) {
-          nl += 1;
-          if (nr >= q) {
-            let idx = nn;
-            while ((idx = text.indexOf('\n', idx + 1)) !== -1 && idx < q) nl++;
-            v += text.slice(cur, q);
-            cur = q;
-            break;
-          }
-          nn = text.indexOf('\n', nn + 1);
-          if (nn === -1 || nn > q) nn = q;
-        } else {
-          v += text.slice(cur, q);
-          cur = q;
-        }
-      }
-      sLine += nl;
-      if (nl > 0) segEnd = -1;
-      nextCR = -1;
-    }
-
-    if (q + 1 < n && text.charCodeAt(q + 1) === 34) {
-      v += '"';
-      pos = q + 2;
-      q = text.indexOf('"', pos);
-      continue;
-    }
-    pos = q + 1;
-    break;
+  // One-step fast path: the next quote closes a clean field. lineEnd and
+  // nextCR are made fresh first so the test is reliable; a stale value
+  // only disables the fast path, it never misfires. The quote must close
+  // before the line end (so no newline inside) and before the next CR
+  // (so no CR inside), and the character after it must not be another
+  // quote (so it is a real closing quote, not the first half of a ""
+  // pair). Then the content is one slice, no loop.
+  if (lineEnd === -1) {
+    lineEnd = src.indexOf('\n', pos);
+    if (lineEnd === -1) lineEnd = srcLen;
   }
-
-  sPos = pos;
-  sSegEnd = segEnd;
-  sNextCR = nextCR;
-  if (pos >= n) {
-    fValue = v;
-    fEnded = END;
-    fAdded = 0;
+  if (nextCR < pos) {
+    nextCR = src.indexOf('\r', pos);
+    if (nextCR === -1) nextCR = srcLen;
+  }
+  let q = src.indexOf('"', pos);
+  if (q !== -1 && q < lineEnd && q < nextCR && src.charCodeAt(q + 1) !== 34) {
+    v = src.slice(pos, q);
+    pos = q + 1;
+  } else {
+    for (;;) {
+      if (q === -1) {
+        // The quote never closes: rewind and re-read as unquoted. The
+        // cursor moves backwards, so every cached position goes stale:
+        // reset them all to -1 (nextDquote in particular must be -1,
+        // not srcLen, or the main loop would believe there is no quote
+        // until the end of the text).
+        pos = openAt + 1;
+        lineNo = openLine;
+        lineEnd = -1;
+        nextComma = -1;
+        nextCR = -1;
+        nextDquote = -1;
+        pushErr('unterminated_quote');
+        readPlain('"');
+        return;
+      }
+      const chunk = src.slice(pos, q);
+      if (chunk.indexOf('\n') === -1 && chunk.indexOf('\r') === -1) {
+        v += chunk;
+      } else {
+        const flat = chunk.replace(/\r\n?/g, '\n');
+        let nl = 0;
+        let at = -1;
+        while ((at = flat.indexOf('\n', at + 1)) !== -1) nl++;
+        lineNo += nl;
+        if (nl > 0) lineEnd = -1;
+        v += flat;
+      }
+      if (src.charCodeAt(q + 1) === 34) {
+        v += '"';
+        pos = q + 2;
+        q = src.indexOf('"', pos);
+        continue;
+      }
+      pos = q + 1;
+      break;
+    }
+  }
+  if (pos >= srcLen) {
+    fieldVal = v;
+    fieldEnd = END_EOF;
+    fieldAdded = 0;
     return;
   }
-  const c = text.charCodeAt(pos);
+  const c = src.charCodeAt(pos);
   if (c === 44) {
-    sPos = pos + 1;
-    fValue = v;
-    fEnded = COMMA;
-    fAdded = 0;
+    pos += 1;
+    fieldVal = v;
+    fieldEnd = END_COMMA;
+    fieldAdded = 0;
     return;
   }
   if (c === 10) {
-    sPos = pos + 1;
-    sLine += 1;
-    fValue = v;
-    fEnded = LINE_BREAK;
-    fAdded = 0;
+    pos += 1;
+    lineNo += 1;
+    fieldVal = v;
+    fieldEnd = END_BREAK;
+    fieldAdded = 0;
     return;
   }
-  if (c === 13 && pos + 1 < n && text.charCodeAt(pos + 1) === 10) {
-    sPos = pos + 2;
-    sLine += 1;
-    fValue = v;
-    fEnded = LINE_BREAK;
-    fAdded = 0;
+  if (c === 13 && src.charCodeAt(pos + 1) === 10) {
+    pos += 2;
+    lineNo += 1;
+    fieldVal = v;
+    fieldEnd = END_BREAK;
+    fieldAdded = 0;
     return;
   }
-  scanUnquotedSlow(v);
-  if (fAdded > 0) sErrors.push({ code: 'quote_junk', line: sRecordLine, row: sRecordRow });
-}
-
-function parseSlowRecord(pos, line, segEnd, nextCR, nextComma) {
-  const text = sText;
-  const n = sN;
-  const f = [];
-  let lastQuoted = false;
-  sRewound = false;
-
-  for (;;) {
-    if (pos < n && text.charCodeAt(pos) === 34) {
-      const start = pos + 1;
-      const q = text.indexOf('"', start);
-      if (q !== -1 && q < segEnd && q < nextCR) {
-        const after = q + 1;
-        if (after >= n) {
-          f.push(start === q ? '' : text.slice(start, q));
-          lastQuoted = true;
-          pos = n;
-          break;
-        }
-        const c = text.charCodeAt(after);
-        if (c === 44) {
-          f.push(start === q ? '' : text.slice(start, q));
-          pos = after + 1;
-          continue;
-        }
-        if (c === 10) {
-          f.push(start === q ? '' : text.slice(start, q));
-          lastQuoted = true;
-          pos = after + 1;
-          line += 1;
-          break;
-        }
-        if (c === 13 && after + 1 < n && text.charCodeAt(after + 1) === 10) {
-          f.push(start === q ? '' : text.slice(start, q));
-          lastQuoted = true;
-          pos = after + 2;
-          line += 1;
-          break;
-        }
-      }
-      sPos = pos;
-      sLine = line;
-      sSegEnd = segEnd;
-      sNextCR = nextCR;
-      sNextComma = nextComma;
-      scanQuotedSlow(q);
-      pos = sPos;
-      line = sLine;
-      segEnd = sSegEnd;
-      nextCR = sNextCR;
-      nextComma = sNextComma;
-      f.push(fValue);
-      if (fEnded !== COMMA) {
-        lastQuoted = true;
-        break;
-      }
-      if (segEnd < pos) {
-        segEnd = text.indexOf('\n', pos);
-        if (segEnd === -1) segEnd = n;
-      }
-      if (nextCR < pos) {
-        nextCR = text.indexOf('\r', pos);
-        if (nextCR === -1) nextCR = n;
-      }
-    } else {
-      if (nextComma < pos) {
-        nextComma = text.indexOf(',', pos);
-        if (nextComma === -1) nextComma = n;
-      }
-      if (nextComma < segEnd) {
-        if (nextComma < nextCR) {
-          f.push(pos === nextComma ? '' : text.slice(pos, nextComma));
-          pos = nextComma + 1;
-          continue;
-        }
-      } else if (segEnd < nextCR || nextCR === n) {
-        f.push(pos === segEnd ? '' : text.slice(pos, segEnd));
-        lastQuoted = false;
-        if (segEnd < n) {
-          pos = segEnd + 1;
-          line += 1;
-        } else {
-          pos = n;
-        }
-        break;
-      } else if (nextCR === segEnd - 1 && segEnd < n) {
-        f.push(pos === nextCR ? '' : text.slice(pos, nextCR));
-        lastQuoted = false;
-        pos = segEnd + 1;
-        line += 1;
-        break;
-      }
-      sPos = pos;
-      sLine = line;
-      sSegEnd = segEnd;
-      sNextCR = nextCR;
-      sNextComma = nextComma;
-      scanUnquotedSlow('');
-      pos = sPos;
-      line = sLine;
-      segEnd = sSegEnd;
-      nextCR = sNextCR;
-      nextComma = sNextComma;
-      f.push(fValue);
-      if (fEnded !== COMMA) {
-        lastQuoted = false;
-        break;
-      }
-      if (segEnd < pos) {
-        segEnd = text.indexOf('\n', pos);
-        if (segEnd === -1) segEnd = n;
-      }
-      if (nextCR < pos) {
-        nextCR = text.indexOf('\r', pos);
-        if (nextCR === -1) nextCR = n;
-      }
-    }
-  }
-  sPos = pos;
-  sLine = line;
-  sNextCR = nextCR;
-  sNextComma = nextComma;
-  fAdded = lastQuoted ? 1 : 0;
-  return f;
-}
-
-function fixWidth(fields, width, recordLine, rows, errors) {
-  const flen = fields.length;
-  const rRow = rows.length;
-  if (flen < width) {
-    errors.push({ code: 'short_row', line: recordLine, row: rRow, fields: flen });
-    while (fields.length < width) fields.push('');
-  } else {
-    errors.push({ code: 'long_row', line: recordLine, row: rRow, extra: fields.splice(width) });
-  }
-}
-
-// Small, independent, monomorphic clean-stretch helpers (LF + CRLF).
-// Keeping each width in its own tiny function eliminates cross-case V8 deopt/recompile storms.
-
-function cleanNoComma(p, nl, nextQuote, nextCR, line, rows) {
-  const text = sText;
-  const n = sN;
-  for (;;) {
-    const end = (nl > p && text.charCodeAt(nl - 1) === 13) ? nl - 1 : nl;
-    if (nextCR < p) {
-      nextCR = text.indexOf('\r', p);
-      if (nextCR === -1) nextCR = n;
-    }
-    if (nextCR < end) break;
-    if (end > p) rows.push([text.slice(p, end)]);
-    p = nl + 1;
-    line += 1;
-    if (p >= nextQuote) break;
-    nl = text.indexOf('\n', p);
-    if (nl === -1 || nl >= nextQuote) break;
-  }
-  sPos = p;
-  sLine = line;
-  sNextCR = nextCR;
-}
-
-function cleanW1(p, nl, nextQuote, nextCR, line, rows) {
-  const text = sText;
-  const n = sN;
-  const errors = sErrors;
-  for (;;) {
-    const end = (nl > p && text.charCodeAt(nl - 1) === 13) ? nl - 1 : nl;
-    if (nextCR < p) {
-      nextCR = text.indexOf('\r', p);
-      if (nextCR === -1) nextCR = n;
-    }
-    if (nextCR < end) break;
-    if (end > p) {
-      const c1 = text.indexOf(',', p);
-      if (c1 === -1 || c1 >= end) {
-        rows.push([text.slice(p, end)]);
-      } else {
-        const fields = text.slice(p, end).split(',');
-        fixWidth(fields, 1, line, rows, errors);
-        rows.push(fields);
-      }
-    }
-    p = nl + 1;
-    line += 1;
-    if (p >= nextQuote) break;
-    nl = text.indexOf('\n', p);
-    if (nl === -1 || nl >= nextQuote) break;
-  }
-  sPos = p;
-  sLine = line;
-  sNextCR = nextCR;
-}
-
-function cleanW2(p, nl, nextQuote, nextCR, line, rows) {
-  const text = sText;
-  const n = sN;
-  const errors = sErrors;
-  for (;;) {
-    const end = (nl > p && text.charCodeAt(nl - 1) === 13) ? nl - 1 : nl;
-    if (nextCR < p) {
-      nextCR = text.indexOf('\r', p);
-      if (nextCR === -1) nextCR = n;
-    }
-    if (nextCR < end) break;
-    if (end > p) {
-      const c1 = text.indexOf(',', p);
-      if (c1 !== -1 && c1 < end) {
-        const c2 = text.indexOf(',', c1 + 1);
-        if (c2 === -1 || c2 >= end) {
-          rows.push([
-            p === c1 ? '' : text.slice(p, c1),
-            c1 + 1 === end ? '' : text.slice(c1 + 1, end),
-          ]);
-          p = nl + 1;
-          line += 1;
-          if (p >= nextQuote) break;
-          nl = text.indexOf('\n', p);
-          if (nl === -1 || nl >= nextQuote) break;
-          continue;
-        }
-      }
-      const fields = text.slice(p, end).split(',');
-      if (fields.length !== 2) fixWidth(fields, 2, line, rows, errors);
-      rows.push(fields);
-    }
-    p = nl + 1;
-    line += 1;
-    if (p >= nextQuote) break;
-    nl = text.indexOf('\n', p);
-    if (nl === -1 || nl >= nextQuote) break;
-  }
-  sPos = p;
-  sLine = line;
-  sNextCR = nextCR;
-}
-
-function cleanW3(p, nl, nextQuote, nextCR, line, rows) {
-  const text = sText;
-  const n = sN;
-  const errors = sErrors;
-  for (;;) {
-    const end = (nl > p && text.charCodeAt(nl - 1) === 13) ? nl - 1 : nl;
-    if (nextCR < p) {
-      nextCR = text.indexOf('\r', p);
-      if (nextCR === -1) nextCR = n;
-    }
-    if (nextCR < end) break;
-    if (end > p) {
-      const c1 = text.indexOf(',', p);
-      if (c1 !== -1 && c1 < end) {
-        const c2 = text.indexOf(',', c1 + 1);
-        if (c2 !== -1 && c2 < end) {
-          const c3 = text.indexOf(',', c2 + 1);
-          if (c3 === -1 || c3 >= end) {
-            rows.push([
-              p === c1 ? '' : text.slice(p, c1),
-              c1 + 1 === c2 ? '' : text.slice(c1 + 1, c2),
-              c2 + 1 === end ? '' : text.slice(c2 + 1, end),
-            ]);
-            p = nl + 1;
-            line += 1;
-            if (p >= nextQuote) break;
-            nl = text.indexOf('\n', p);
-            if (nl === -1 || nl >= nextQuote) break;
-            continue;
-          }
-        }
-      }
-      const fields = text.slice(p, end).split(',');
-      if (fields.length !== 3) fixWidth(fields, 3, line, rows, errors);
-      rows.push(fields);
-    }
-    p = nl + 1;
-    line += 1;
-    if (p >= nextQuote) break;
-    nl = text.indexOf('\n', p);
-    if (nl === -1 || nl >= nextQuote) break;
-  }
-  sPos = p;
-  sLine = line;
-  sNextCR = nextCR;
-}
-
-function cleanW4(p, nl, nextQuote, nextCR, line, rows) {
-  const text = sText;
-  const n = sN;
-  const errors = sErrors;
-  for (;;) {
-    const end = (nl > p && text.charCodeAt(nl - 1) === 13) ? nl - 1 : nl;
-    if (nextCR < p) {
-      nextCR = text.indexOf('\r', p);
-      if (nextCR === -1) nextCR = n;
-    }
-    if (nextCR < end) break;
-    if (end > p) {
-      const c1 = text.indexOf(',', p);
-      if (c1 !== -1 && c1 < end) {
-        const c2 = text.indexOf(',', c1 + 1);
-        if (c2 !== -1 && c2 < end) {
-          const c3 = text.indexOf(',', c2 + 1);
-          if (c3 !== -1 && c3 < end) {
-            const c4 = text.indexOf(',', c3 + 1);
-            if (c4 === -1 || c4 >= end) {
-              rows.push([
-                p === c1 ? '' : text.slice(p, c1),
-                c1 + 1 === c2 ? '' : text.slice(c1 + 1, c2),
-                c2 + 1 === c3 ? '' : text.slice(c2 + 1, c3),
-                c3 + 1 === end ? '' : text.slice(c3 + 1, end),
-              ]);
-              p = nl + 1;
-              line += 1;
-              if (p >= nextQuote) break;
-              nl = text.indexOf('\n', p);
-              if (nl === -1 || nl >= nextQuote) break;
-              continue;
-            }
-          }
-        }
-      }
-      const fields = text.slice(p, end).split(',');
-      if (fields.length !== 4) fixWidth(fields, 4, line, rows, errors);
-      rows.push(fields);
-    }
-    p = nl + 1;
-    line += 1;
-    if (p >= nextQuote) break;
-    nl = text.indexOf('\n', p);
-    if (nl === -1 || nl >= nextQuote) break;
-  }
-  sPos = p;
-  sLine = line;
-  sNextCR = nextCR;
-}
-
-function cleanGeneral(p, nl, nextQuote, nextCR, line, width, rows) {
-  const text = sText;
-  const n = sN;
-  const errors = sErrors;
-  for (;;) {
-    const end = (nl > p && text.charCodeAt(nl - 1) === 13) ? nl - 1 : nl;
-    if (nextCR < p) {
-      nextCR = text.indexOf('\r', p);
-      if (nextCR === -1) nextCR = n;
-    }
-    if (nextCR < end) break;
-    if (end > p) {
-      const fields = text.slice(p, end).split(',');
-      if (fields.length !== width) fixWidth(fields, width, line, rows, errors);
-      rows.push(fields);
-    }
-    p = nl + 1;
-    line += 1;
-    if (p >= nextQuote) break;
-    nl = text.indexOf('\n', p);
-    if (nl === -1 || nl >= nextQuote) break;
-  }
-  sPos = p;
-  sLine = line;
-  sNextCR = nextCR;
+  readPlain(v);
+  if (fieldAdded > 0) pushErr('quote_junk');
 }
 
 /** csv-reader 1.0.0's answer for one case's input. */
 export function run(input) {
-  const text = String(input.text);
-  const header = input.header === true;
-  const errors = [];
-  const rows = [];
-  let columns = null;
-  let width = -1;
-  const n = text.length;
-  let pos = n > 0 && text.charCodeAt(0) === 0xFEFF ? 1 : 0;
-  let line = 1;
-  let nextQuote = -1;
-  let nextCR = -1;
-  let nextComma = -1;
-
-  sText = text;
-  sN = n;
-  sErrors = errors;
+  src = String(input.text);
+  const wantHeader = input.header === true;
+  errs = [];
+  outRows = [];
+  outCols = null;
+  rowWidth = -1;
+  srcLen = src.length;
+  pos = 0;
+  lineNo = 1;
+  if (srcLen > 0 && src.charCodeAt(0) === 0xFEFF) pos = 1;
+  recLineNo = 1;
+  recRowIdx = null;
+  fieldVal = '';
+  fieldEnd = END_EOF;
+  fieldAdded = 0;
+  lineEnd = -1;
+  nextDquote = -1;
+  nextCR = -1;
+  nextComma = -1;
 
   for (;;) {
-    while (pos < n) {
-      const c = text.charCodeAt(pos);
-      if (c > 13) break;
+    // Lines with no characters are no records.
+    while (pos < srcLen) {
+      const c = src.charCodeAt(pos);
       if (c === 10) {
         pos += 1;
-        line += 1;
-      } else if (c === 13 && pos + 1 < n && text.charCodeAt(pos + 1) === 10) {
+        lineNo += 1;
+      } else if (c === 13 && src.charCodeAt(pos + 1) === 10) {
         pos += 2;
-        line += 1;
+        lineNo += 1;
       } else {
         break;
       }
     }
-    if (pos >= n) break;
+    if (pos >= srcLen) break;
 
-    if (nextQuote < pos) {
-      nextQuote = text.indexOf('"', pos);
-      if (nextQuote === -1) nextQuote = n;
+    recLineNo = lineNo;
+    recRowIdx = wantHeader && outCols === null ? null : outRows.length;
+
+    if (nextDquote < pos) {
+      nextDquote = src.indexOf('"', pos);
+      if (nextDquote === -1) nextDquote = srcLen;
     }
     if (nextCR < pos) {
-      nextCR = text.indexOf('\r', pos);
-      if (nextCR === -1) nextCR = n;
+      nextCR = src.indexOf('\r', pos);
+      if (nextCR === -1) nextCR = srcLen;
     }
 
-    const recordLine = line;
-    let segEnd = text.indexOf('\n', pos);
-    if (segEnd === -1) segEnd = n;
-    const contentEnd = (segEnd < n && segEnd > pos && text.charCodeAt(segEnd - 1) === 13) ? segEnd - 1 : segEnd;
-
-    let fields;
-    let lastQuoted = false;
-    if (nextQuote >= segEnd && nextCR >= contentEnd) {
-      if (width > 0 && segEnd < nextQuote) {
-        if (width === 1) {
-          if (nextComma < pos) {
-            nextComma = text.indexOf(',', pos);
-            if (nextComma === -1) nextComma = n;
+    // Block fast path: no '"' and no CR ahead, so a stretch of clean LF
+    // lines. Take up to 64 KB, cut it at the last complete line, and let
+    // one split('\n') break the lines instead of one indexOf + slice per
+    // record in JS. The 64 KB cap keeps the temporary array small. Only
+    // enter it for a meaningful clean stretch (>= 256 chars): when the
+    // file uses CRLF or almost every row carries a quote, the clean end
+    // sits close to pos and the lastIndexOf call on every row is wasted
+    // overhead.
+    const cleanEnd = nextDquote < nextCR ? nextDquote : nextCR;
+    if (cleanEnd - pos >= 256) {
+      const cap = pos + 65536;
+      const bound = cleanEnd < cap ? cleanEnd : cap;
+      const cutAt = src.lastIndexOf('\n', bound - 1);
+      if (cutAt > pos) {
+        const blockLines = src.slice(pos, cutAt).split('\n');
+        for (let i = 0; i < blockLines.length; i++) {
+          const ln = blockLines[i];
+          if (ln.length === 0) {
+            lineNo += 1;
+            continue;
           }
-          if (nextComma >= nextQuote) {
-            cleanNoComma(pos, segEnd, nextQuote, nextCR, line, rows);
-          } else {
-            cleanW1(pos, segEnd, nextQuote, nextCR, line, rows);
+          const flds = ln.split(',');
+          if (rowWidth < 0) rowWidth = flds.length;
+          if (wantHeader && outCols === null) {
+            outCols = flds;
+            lineNo += 1;
+            continue;
           }
-        } else if (width === 3) {
-          cleanW3(pos, segEnd, nextQuote, nextCR, line, rows);
-        } else if (width === 2) {
-          cleanW2(pos, segEnd, nextQuote, nextCR, line, rows);
-        } else if (width === 4) {
-          cleanW4(pos, segEnd, nextQuote, nextCR, line, rows);
-        } else {
-          cleanGeneral(pos, segEnd, nextQuote, nextCR, line, width, rows);
+          const fl = flds.length;
+          if (fl !== rowWidth) {
+            const rr = outRows.length;
+            if (fl < rowWidth) {
+              errs.push({ code: 'short_row', line: lineNo, row: rr, fields: fl });
+              while (flds.length < rowWidth) flds.push('');
+            } else {
+              errs.push({ code: 'long_row', line: lineNo, row: rr, extra: flds.splice(rowWidth) });
+            }
+          }
+          outRows.push(flds);
+          lineNo += 1;
         }
-        pos = sPos;
-        line = sLine;
-        nextCR = sNextCR;
+        pos = cutAt + 1;
         continue;
       }
-      fields = text.slice(pos, contentEnd).split(',');
-      if (segEnd < n) {
-        pos = segEnd + 1;
-        line += 1;
+    }
+
+    // Single-line fast path (also catches a clean CRLF line): the
+    // lookahead says no '"' before the line end and no CR before the
+    // content end.
+    lineEnd = src.indexOf('\n', pos);
+    if (lineEnd === -1) lineEnd = srcLen;
+    let bodyEnd = lineEnd;
+    if (lineEnd < srcLen && lineEnd > pos && src.charCodeAt(lineEnd - 1) === 13) bodyEnd = lineEnd - 1;
+    let flds;
+    let lastWasQuoted = false;
+    if (nextDquote >= lineEnd && nextCR >= bodyEnd) {
+      flds = src.slice(pos, bodyEnd).split(',');
+      if (lineEnd < srcLen) {
+        pos = lineEnd + 1;
+        lineNo += 1;
       } else {
-        pos = n;
+        pos = srcLen;
       }
     } else {
-      sRecordLine = recordLine;
-      sRecordRow = (width < 0 && header) ? null : rows.length;
-      fields = parseSlowRecord(pos, line, segEnd, nextCR, nextComma);
-      pos = sPos;
-      line = sLine;
-      nextCR = sNextCR;
-      nextComma = sNextComma;
-      lastQuoted = fAdded === 1;
-      if (sRewound) {
-        nextQuote = -1;
-        nextCR = -1;
-        nextComma = -1;
-      }
+      // Packed array via push (vs a pre-sized array, which is holey).
+      const acc = [];
+      let how;
+      do {
+        if (src.charCodeAt(pos) === 34) {
+          lastWasQuoted = true;
+          readQuoted();
+        } else {
+          lastWasQuoted = false;
+          readPlain('');
+        }
+        acc.push(fieldVal);
+        how = fieldEnd;
+      } while (how === END_COMMA);
+      flds = acc;
     }
 
-    if (fields.length === 1 && fields[0] === '' && !lastQuoted) continue;
+    // A line that held only stray CRs is left with no characters: no
+    // record (its stray_cr errors stay).
+    if (flds.length === 1 && flds[0] === '' && !lastWasQuoted) continue;
 
-    if (width < 0) {
-      width = fields.length;
-      if (header) {
-        columns = fields;
-        continue;
+    if (rowWidth < 0) rowWidth = flds.length;
+    if (wantHeader && outCols === null) {
+      outCols = flds;
+      continue;
+    }
+    const fl = flds.length;
+    if (fl !== rowWidth) {
+      if (fl < rowWidth) {
+        errs.push({ code: 'short_row', line: recLineNo, row: recRowIdx, fields: fl });
+        while (flds.length < rowWidth) flds.push('');
+      } else {
+        errs.push({ code: 'long_row', line: recLineNo, row: recRowIdx, extra: flds.splice(rowWidth) });
       }
     }
-    if (fields.length !== width) fixWidth(fields, width, recordLine, rows, errors);
-    rows.push(fields);
+    outRows.push(flds);
   }
 
-  sText = '';
-  sErrors = null;
-  return { columns: header ? (columns ?? []) : null, rows, errors };
+  return { columns: wantHeader ? (outCols ?? []) : null, rows: outRows, errors: errs };
 }
